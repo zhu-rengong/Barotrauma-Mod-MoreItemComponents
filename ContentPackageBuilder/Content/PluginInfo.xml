@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PluginInfos notsyncedinmultiplayer="false">
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Windows/MoreItemComponentsClient.dll" platforms="Windows" targets="Client" />
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Windows/MoreItemComponentsServer.dll" platforms="Windows" targets="Server" />
+
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Linux/MoreItemComponentsClient.dll" platforms="Linux" targets="Client" />
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Linux/MoreItemComponentsServer.dll" platforms="Linux" targets="Server" />
+
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Mac/MoreItemComponentsClient.dll" platforms="Mac" targets="Client" />
+  <MainAssemblyInfo assemblypath="%ModDir%/bin/Mac/MoreItemComponentsServer.dll" platforms="Mac" targets="Server" />
+</PluginInfos>
