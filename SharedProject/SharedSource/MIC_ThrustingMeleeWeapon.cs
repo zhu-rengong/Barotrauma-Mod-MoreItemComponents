@@ -264,7 +264,7 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
 
     public override bool Use(float deltaTime, Character? character = null)
     {
-        return character is { Removed: false } && reloadTimer <= 0.0f;
+        return false;
     }
 
     public override void Drop(Character? dropper, bool setTransform = true)
