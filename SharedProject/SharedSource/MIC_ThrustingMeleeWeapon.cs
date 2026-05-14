@@ -3,8 +3,7 @@ using Barotrauma.Items.Components;
 using FarseerPhysics;
 using FarseerPhysics.Dynamics;
 using FarseerPhysics.Dynamics.Contacts;
-using System;
-using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
 
 namespace MoreItemComponents;
 
@@ -75,6 +74,10 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
     public PhysicsBody? Hitbox => hitbox;
     private Vector2 hitboxOffset;
 
+    private readonly record struct ImpactResult(Fixture TargetFixture, Vector2 ContactPoint);
+
+    private new readonly Queue<ImpactResult> impactQueue = new Queue<ImpactResult>();
+
     [Editable, Serialize(0.5f, IsPropertySaveable.Yes, description: "Time to reach full charge (seconds).")]
     public float MaxChargeTime { get; set; }
 
@@ -108,10 +111,18 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
     private enum SpecialActionType
     {
         OnChargeStart, Charging,
-        OnThrustStart, Thrusting, OnThrustEnd
+        OnThrustStart, Thrusting, OnThrustEnd,
+        OnImpact
     }
 
-    private Dictionary<SpecialActionType, List<StatusEffect>>? thrustingMeleeWeaponStatusEffects;
+    private class StatusEffectWrapper
+    {
+        public required StatusEffect Value;
+        public required bool SetPositionToHitbox;
+        public required bool SetPositionToContactPointOnImpact;
+    }
+
+    private Dictionary<SpecialActionType, List<StatusEffectWrapper>>? thrustingMeleeWeaponStatusEffects;
 
     public MIC_ThrustingMeleeWeapon(Item item, ContentXElement element) : base(item, element)
     {
@@ -141,14 +152,19 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
                 thrustingMeleeWeaponStatusEffects ??= new();
                 if (!thrustingMeleeWeaponStatusEffects.TryGetValue(type, out var effectList))
                 {
-                    thrustingMeleeWeaponStatusEffects.Add(type, effectList = new List<StatusEffect>());
+                    thrustingMeleeWeaponStatusEffects.Add(type, effectList = new List<StatusEffectWrapper>());
                 }
-                effectList.Add(statusEffect);
+                effectList.Add(new StatusEffectWrapper()
+                {
+                    Value = statusEffect,
+                    SetPositionToHitbox = el.GetAttributeBool("setpositiontohitbox", false),
+                    SetPositionToContactPointOnImpact = el.GetAttributeBool("setpositiontocontactpointonimpact", false)
+                });
             }
         }
     }
 
-    private void ApplyStatusEffects(SpecialActionType type, float deltaTime, Character? character = null, Character? user = null)
+    private void ApplyStatusEffects(SpecialActionType type, float deltaTime, Character? character = null, Character? user = null, Vector2? contactPosition = null)
     {
         if (thrustingMeleeWeaponStatusEffects is null
             || !thrustingMeleeWeaponStatusEffects.TryGetValue(type, out var statusEffectList))
@@ -156,10 +172,25 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
             return;
         }
 
-        foreach (var effect in statusEffectList)
+        foreach (var effectWrapper in statusEffectList)
         {
+            var effect = effectWrapper.Value;
             if (user is not null) { effect.SetUser(user); }
-            item.ApplyStatusEffect(effect, effect.Type, deltaTime, character);
+            Vector2? position = null;
+            if (effectWrapper.SetPositionToHitbox)
+            {
+                position = hitbox is not null
+                    ? hitbox.Submarine is Submarine submarine
+                        ? hitbox.Position + submarine.Position
+                        : hitbox.Position
+                    : null;
+            }
+            else if (effectWrapper.SetPositionToContactPointOnImpact)
+            {
+                position = contactPosition;
+            }
+
+            item.ApplyStatusEffect(effect, effect.Type, deltaTime, character, worldPosition: position);
         }
     }
 
@@ -270,19 +301,14 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
     public override void Drop(Character? dropper, bool setTransform = true)
     {
         base.Drop(dropper, setTransform);
-        DisableThrustCollision();
+        TransitionTo(State.Idle);
     }
 
     public override void UpdateBroken(float deltaTime, Camera cam) => Update(deltaTime, cam);
 
     public override void Update(float deltaTime, Camera cam)
     {
-        if (!item.body.Enabled)
-        {
-            return;
-        }
-
-        if (picker is null || !picker.HeldItems.Contains(item))
+        if (!item.body.Enabled || picker is not { Removed: false } || !picker.HeldItems.Contains(item))
         {
             TransitionTo(State.Idle);
             IsActive = false;
@@ -291,49 +317,28 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
 
         if (impactQueue.Any())
         {
-            // didn't work as HandleImpact will overwrite the damage multiplier
-            if (Attack is Attack attack)
-            {
-                float damageMultiplier = MathHelper.Lerp(1.0f, ChargeAttackMultiplier, ChargeProgress);
-                attack.DamageMultiplier = damageMultiplier;
-            }
-
             while (impactQueue.Count > 0)
             {
-                HandleImpact(impactQueue.Dequeue());
-            }
-        }
-
-        if (picker is null) { return; }
-
-        for (int i = activeForces.Count - 1; i >= 0; i--)
-        {
-            var activeForce = activeForces[i];
-            var spec = activeForce.Specification;
-
-            activeForce.Timer -= deltaTime;
-
-            if (activeForce.Timer >= spec.Duration)
-            {
-                continue;
-            }
-
-            if (activeForce.Timer <= 0f || !CheckForceValidity(picker, spec))
-            {
-                activeForces.RemoveAt(i);
-                continue;
-            }
-
-            foreach (var limb in picker.AnimController.Limbs)
-            {
-                if (!limb.IsSevered && !limb.Removed && spec.LimbTypes.Contains(limb.type))
+                // didn't work as HandleImpact will overwrite the damage multiplier
+                if (Attack is Attack attack)
                 {
-                    limb.body.ApplyForce(activeForce.ForceWorld * limb.Mass);
+                    float damageMultiplier = MathHelper.Lerp(1.0f, ChargeAttackMultiplier, ChargeProgress);
+                    attack.DamageMultiplier = damageMultiplier;
                 }
+
+                var impactResult = impactQueue.Dequeue();
+                Vector2 position = ConvertUnits.ToDisplayUnits(impactResult.ContactPoint);
+                var hull = Hull.FindHull(position, guess: item.CurrentHull, useWorldCoordinates: false);
+                ApplyStatusEffects(SpecialActionType.OnImpact, 1.0f, character: picker, user: User,
+                    contactPosition: hull?.Submarine is Submarine submarine
+                        ? position + submarine.Position
+                        : position);
+                HandleImpact(impactResult.TargetFixture);
             }
         }
 
         SyncHitbox();
+
         reloadTimer = Math.Max(0f, reloadTimer - deltaTime);
         bool aimHeld = picker.IsKeyDown(InputType.Aim) && picker.CanAim && !UsageDisabledByRangedWeapon(picker);
         bool shootDown = picker.IsKeyDown(InputType.Shoot);
@@ -345,61 +350,98 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
                 break;
 
             case State.Aiming:
-                if (aimHeld && CanControlWeapon(picker))
-                {
-                    if (shootDown && reloadTimer <= 0)
-                    {
-                        TransitionTo(State.Charging);
-                    }
-                }
-                else
+                if (!(aimHeld && CanControlWeapon(picker)))
                 {
                     TransitionTo(State.Idle);
+                    break;
+                }
+
+                if (shootDown && reloadTimer <= 0)
+                {
+                    TransitionTo(State.Charging);
                 }
                 break;
 
             case State.Charging:
-                if (aimHeld && CanControlWeapon(User))
+                if (picker != User)
                 {
-                    if (shootDown)
-                    {
-                        ChargeTimer += deltaTime;
-                        ApplyStatusEffects(SpecialActionType.Charging, deltaTime, character: picker, user: User);
-                    }
-                    else
-                    {
-                        TransitionTo(State.Thrusting);
-                    }
+                    TransitionTo(State.Idle);
+                    break;
+                }
+
+                if (!(aimHeld && CanControlWeapon(User)))
+                {
+                    TransitionTo(State.Idle);
+                    break;
+                }
+
+                if (shootDown)
+                {
+                    ChargeTimer += deltaTime;
+                    ApplyStatusEffects(SpecialActionType.Charging, deltaTime, character: picker, user: User);
                 }
                 else
                 {
-                    TransitionTo(State.Idle);
+                    TransitionTo(State.Thrusting);
                 }
                 break;
 
             case State.Thrusting:
-                if (CanControlWeapon(User))
+                if (picker != User)
                 {
-                    ThrustTimer += deltaTime;
-                    if (ThrustProgress < 1.0f)
+                    TransitionTo(State.Idle);
+                    break;
+                }
+
+                if (!CanControlWeapon(User))
+                {
+                    ApplyStatusEffects(SpecialActionType.OnThrustEnd, 1.0f, character: picker, user: User);
+                    TransitionTo(State.Idle);
+                    break;
+                }
+
+                if (item.AiTarget != null)
+                {
+                    item.AiTarget.SoundRange = item.AiTarget.MaxSoundRange;
+                    item.AiTarget.SightRange = item.AiTarget.MaxSightRange;
+                }
+
+                ThrustTimer += deltaTime;
+
+                if (ThrustProgress == 1.0f)
+                {
+                    ApplyStatusEffects(SpecialActionType.OnThrustEnd, 1.0f, character: picker, user: User);
+                    TransitionTo(aimHeld ? State.Aiming : State.Idle);
+                    break;
+                }
+
+                ApplyStatusEffects(SpecialActionType.Thrusting, deltaTime, character: picker, user: User);
+
+                for (int i = activeForces.Count - 1; i >= 0; i--)
+                {
+                    var activeForce = activeForces[i];
+                    var spec = activeForce.Specification;
+
+                    activeForce.Timer -= deltaTime;
+
+                    if (activeForce.Timer >= spec.Duration)
                     {
-                        ApplyStatusEffects(SpecialActionType.Thrusting, deltaTime, character: picker, user: User);
-                        if (item.AiTarget != null)
+                        continue;
+                    }
+
+                    if (activeForce.Timer <= 0f || !CheckForceValidity(User, spec))
+                    {
+                        activeForces.RemoveAt(i);
+                        continue;
+                    }
+
+                    foreach (var limb in User.AnimController.Limbs)
+                    {
+                        if (!limb.IsSevered && !limb.Removed && spec.LimbTypes.Contains(limb.type))
                         {
-                            item.AiTarget.SoundRange = item.AiTarget.MaxSoundRange;
-                            item.AiTarget.SightRange = item.AiTarget.MaxSightRange;
+                            limb.body.ApplyForce(activeForce.ForceWorld * limb.Mass);
                         }
                     }
-                    else
-                    {
-                        FinishThrusting();
-                        TransitionTo(aimHeld ? State.Aiming : State.Idle);
-                    }
-                }
-                else
-                {
-                    FinishThrusting();
-                    TransitionTo(State.Idle);
                 }
                 break;
         }
@@ -413,17 +455,9 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
 
         AnimateHold(deltaTime, aimHeld);
 
-        bool CanControlWeapon(Character? character)
+        bool CanControlWeapon([NotNullWhen(true)] Character? character)
         {
             return character is { IsKnockedDownOrRagdolled: false, LockHands: false, AllowInput: true };
-        }
-
-        void FinishThrusting()
-        {
-            reloadTimer = Reload;
-            reloadTimer /= 1f + picker.GetStatValue(StatTypes.MeleeAttackSpeed);
-            reloadTimer /= 1f + item.GetQualityModifier(Quality.StatType.StrikingSpeedMultiplier);
-            ApplyStatusEffects(SpecialActionType.OnThrustEnd, 1.0f, character: picker, user: User);
         }
     }
 
@@ -442,7 +476,7 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
         if (item.FlippedY) { offset.Y = -offset.Y; }
 
         hitbox.ResetDynamics();
-        hitbox.SetTransform(item.body.SimPosition + offset, item.body.Rotation);
+        hitbox.SetTransformIgnoreContacts(item.body.SimPosition + offset, item.body.Rotation);
     }
 
     private void AnimateHold(float deltaTime, bool aimHeld)
@@ -493,6 +527,7 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
                 break;
 
             case State.Thrusting:
+                controller.LockFlipping();
                 Vector2 thrustOffset = ConvertUnits.ToSimUnits(ThrustHoldPosOffset) * ThrustProgress;
                 controller.HoldItem(deltaTime, item, scaledHandlePos, itemPos: aimPos + thrustOffset,
                     aim: true, holdAngle, aimAngle, aimMelee: true);
@@ -502,22 +537,30 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
 
     private void TransitionTo(State newState)
     {
-        if (currentState == State.Thrusting && newState != State.Thrusting)
+        switch (newState)
         {
-            User = null;
+            case State.Idle:
+            case State.Aiming:
+                ChargeTimer = 0f;
+                break;
+        }
+
+        if (newState is not State.Thrusting && currentState is State.Thrusting)
+        {
+            ThrustTimer = 0f;
             DisableThrustCollision();
             hitting = false;
             activeForces.Clear();
+            reloadTimer = Reload;
+            if (picker is not null)
+            {
+                reloadTimer /= 1f + picker.GetStatValue(StatTypes.MeleeAttackSpeed);
+            }
+            reloadTimer /= 1f + item.GetQualityModifier(Quality.StatType.StrikingSpeedMultiplier);
         }
 
         switch (newState)
         {
-            case State.Idle:
-                break;
-
-            case State.Aiming:
-                break;
-
             case State.Charging:
                 SetUser(picker);
                 ChargeTimer = 0f;
@@ -530,7 +573,6 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
                 ActivateNearbySleepingCharacters();
                 EnableThrustCollision();
                 hitting = true;
-                picker.AnimController?.LockFlipping(ThrustDuration);
                 ApplyThrustForces(User!);
                 ApplyStatusEffects(SpecialActionType.OnThrustStart, 1.0f, character: picker, user: User);
                 break;
@@ -548,20 +590,26 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
         hitbox.Enabled = true;
     }
 
-    private void DisableThrustCollision()
+    private void DisableThrustCollision(bool clearImpactQueue = true)
     {
-        impactQueue.Clear();
+        if (clearImpactQueue)
+        {
+            impactQueue.Clear();
+        }
         hitTargets.Clear();
         if (hitbox?.Removed ?? true) { return; }
         hitbox.FarseerBody.OnCollision -= OnThrustCollision;
         hitbox.FarseerBody.IsBullet = false;
-        hitbox.PhysEnabled = false;
-        hitbox.Enabled = false;
+        if (!hitbox.FarseerBody.World.IsLocked)
+        {
+            hitbox.PhysEnabled = false;
+            hitbox.Enabled = false;
+        }
     }
 
     private bool OnThrustCollision(Fixture f1, Fixture f2, Contact contact)
     {
-        if (User?.AnimController is not AnimController controller || User.Removed)
+        if (User is null || User.Removed || User.AnimController is not AnimController controller)
         {
             DisableThrustCollision();
             return false;
@@ -615,7 +663,7 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
 
         if (hitAccepted)
         {
-            impactQueue.Enqueue(f2);
+            impactQueue.Enqueue(new(f2, points[0]));
             return true;
         }
 
@@ -628,7 +676,10 @@ partial class MIC_ThrustingMeleeWeapon : MeleeWeapon
             {
                 hitTargets.Add(target);
             }
-            if ((!AllowHitMultiple || hitTargets.Count >= MaxTargetsToHit) && hitbox is not null) { hitbox.FarseerBody.OnCollision -= OnThrustCollision; }
+            if (!AllowHitMultiple || hitTargets.Count >= MaxTargetsToHit)
+            {
+                DisableThrustCollision(clearImpactQueue: false);
+            }
             return true;
         }
     }
